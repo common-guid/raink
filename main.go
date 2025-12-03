@@ -19,10 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/invopop/jsonschema"
-	"github.com/openai/openai-go"
-	"github.com/openai/openai-go/option"
-	"github.com/pkoukk/tiktoken-go"
+	"github.com/google/generative-ai-go/genai"
+	"google.golang.org/api/option"
 )
 
 const idLen = 8
@@ -41,12 +39,11 @@ type Config struct {
 	BatchSize       int
 	NumRuns         int
 	OllamaModel     string
-	OpenAIModel     openai.ChatModel
+	Model           string
 	TokenLimit      int
 	RefinementRatio float64
-	OpenAIKey       string
+	GeminiKey       string
 	OllamaAPIURL    string
-	Encoding        string
 	BatchTokens     int
 }
 
@@ -64,18 +61,18 @@ func (c *Config) Validate() error {
 	if c.TokenLimit <= 0 {
 		return fmt.Errorf("token limit must be greater than 0")
 	}
-	if c.OllamaModel == "" && c.OpenAIKey == "" {
-		return fmt.Errorf("openai key cannot be empty")
+	if c.OllamaModel == "" && c.GeminiKey == "" {
+		return fmt.Errorf("gemini key cannot be empty")
 	}
 	return nil
 }
 
 type Ranker struct {
-	cfg        *Config
-	encoding   *tiktoken.Tiktoken
-	rng        *rand.Rand
-	numBatches int
-	round      int
+	cfg         *Config
+	genaiClient *genai.Client
+	rng         *rand.Rand
+	numBatches  int
+	round       int
 }
 
 func NewRanker(config *Config) (*Ranker, error) {
@@ -83,15 +80,19 @@ func NewRanker(config *Config) (*Ranker, error) {
 		return nil, err
 	}
 
-	encoding, err := tiktoken.GetEncoding(config.Encoding)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tiktoken encoding: %w", err)
+	var client *genai.Client
+	if config.GeminiKey != "" {
+		var err error
+		client, err = genai.NewClient(context.Background(), option.WithAPIKey(config.GeminiKey))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gemini client: %w", err)
+		}
 	}
 
 	return &Ranker{
-		cfg:      config,
-		encoding: encoding,
-		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		cfg:         config,
+		genaiClient: client,
+		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
 	}, nil
 }
 
@@ -119,17 +120,21 @@ type FinalResult struct {
 
 var dryRun bool
 
-func GenerateSchema[T any]() interface{} {
-	reflector := jsonschema.Reflector{
-		AllowAdditionalProperties: false,
-		DoNotReference:            true,
+func getRankedObjectResponseSchema() *genai.Schema {
+	return &genai.Schema{
+		Type: genai.TypeObject,
+		Properties: map[string]*genai.Schema{
+			"objects": {
+				Type: genai.TypeArray,
+				Items: &genai.Schema{
+					Type: genai.TypeString,
+				},
+				Description: "List of ranked object IDs",
+			},
+		},
+		Required: []string{"objects"},
 	}
-	var v T
-	schema := reflector.Reflect(v)
-	return schema
 }
-
-var RankedObjectResponseSchema = GenerateSchema[RankedObjectResponse]()
 
 func ShortDeterministicID(input string, length int) string {
 	// Step 1: Hash the input using SHA-256
@@ -154,7 +159,8 @@ func main() {
 	numRuns := flag.Int("r", 10, "Number of runs")
 	batchTokens := flag.Int("t", 128000, "Max tokens per batch")
 	initialPrompt := flag.String("p", "", "Initial prompt")
-	ollamaModel := flag.String("ollama-model", "", "Ollama model name (if not set, OpenAI will be used)")
+	ollamaModel := flag.String("ollama-model", "", "Ollama model name (if not set, Gemini will be used)")
+	model := flag.String("m", "gemini-2.5-flash", "Gemini model name")
 	flag.BoolVar(&dryRun, "dry-run", false, "Enable dry run mode (log API calls without making them)")
 	refinementRatio := flag.Float64("ratio", 0.5, "Refinement ratio as a decimal (e.g., 0.5 for 50%)")
 	flag.Parse()
@@ -172,7 +178,7 @@ func main() {
 	var tokenLimitThreshold = int(0.95 * float64(*batchTokens))
 
 	if *inputFile == "" {
-		log.Println("Usage: go run main.go -f <input_file> [-s <batch_size>] [-r <num_runs>] [-p <initial_prompt>] [-t <batch_tokens>] [-ollama-model <model_name>] [-ratio <refinement_ratio>]")
+		log.Println("Usage: go run main.go -f <input_file> [-s <batch_size>] [-r <num_runs>] [-p <initial_prompt>] [-t <batch_tokens>] [-m <model_name>] [-ollama-model <model_name>] [-ratio <refinement_ratio>]")
 		return
 	}
 
@@ -181,19 +187,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	apiKey := os.Getenv("OPENAI_API_KEY")
+	apiKey := os.Getenv("GEMINI_API_KEY")
 
 	apiURL := os.Getenv("OLLAMA_API_URL")
 	if apiURL == "" {
 		apiURL = "http://localhost:11434/api/chat"
 	}
-
-	// TODO: Make this configurable.
-	// https://pkg.go.dev/github.com/openai/openai-go@v0.1.0-alpha.38#ChatModel
-	// const model = openai.ChatModelGPT4o2024_08_06
-	const model = openai.ChatModelGPT4oMini
-
-	const enc = "o200k_base"
 
 	config := &Config{
 		InitialPrompt:   *initialPrompt,
@@ -202,10 +201,9 @@ func main() {
 		OllamaModel:     *ollamaModel,
 		TokenLimit:      tokenLimitThreshold,
 		RefinementRatio: *refinementRatio,
-		OpenAIKey:       apiKey,
+		GeminiKey:       apiKey,
 		OllamaAPIURL:    apiURL,
-		OpenAIModel:     model,
-		Encoding:        enc,
+		Model:           *model,
 		BatchTokens:     *batchTokens,
 	}
 
@@ -531,8 +529,16 @@ func (r *Ranker) estimateTokens(group []Object) int {
 		// TODO: Update to use Ollama tokenize API when this PR is merged:
 		// https://github.com/ollama/ollama/pull/6586
 		return len(prompt) / 4
+	} else if r.genaiClient != nil {
+		model := r.genaiClient.GenerativeModel(r.cfg.Model)
+		resp, err := model.CountTokens(context.Background(), genai.Text(prompt))
+		if err != nil {
+			log.Printf("Error counting tokens: %v", err)
+			return len(prompt) / 4
+		}
+		return int(resp.TotalTokens)
 	} else {
-		return len(r.encoding.Encode(prompt, nil, nil))
+		return len(prompt) / 4
 	}
 }
 
@@ -563,7 +569,7 @@ func (r *Ranker) rankObjects(group []Object, runNumber int, batchNumber int) []R
 	if r.cfg.OllamaModel != "" {
 		rankedResponse = r.callOllama(prompt, runNumber, batchNumber, inputIDs)
 	} else {
-		rankedResponse = r.callOpenAI(prompt, runNumber, batchNumber, inputIDs)
+		rankedResponse = r.callGemini(prompt, runNumber, batchNumber, inputIDs)
 	}
 
 	// Assign scores based on position in the ranked list
@@ -650,68 +656,71 @@ func validateIDs(rankedResponse *RankedObjectResponse, inputIDs map[string]bool)
 	}
 }
 
-func (r *Ranker) callOpenAI(prompt string, runNum int, batchNum int, inputIDs map[string]bool) RankedObjectResponse {
-
-	customTransport := &CustomTransport{Transport: http.DefaultTransport}
-	customClient := &http.Client{Transport: customTransport}
-
-	client := openai.NewClient(
-		option.WithAPIKey(r.cfg.OpenAIKey),
-		option.WithHTTPClient(customClient),
-		option.WithMaxRetries(5),
-	)
-
+func (r *Ranker) callGemini(prompt string, runNum int, batchNum int, inputIDs map[string]bool) RankedObjectResponse {
 	backoff := time.Second
 
-	conversationHistory := []openai.ChatCompletionMessageParamUnion{
-		openai.UserMessage(prompt),
+	conversationHistory := []*genai.Content{
+		{
+			Parts: []genai.Part{
+				genai.Text(prompt),
+			},
+			Role: "user",
+		},
 	}
 
+	model := r.genaiClient.GenerativeModel(r.cfg.Model)
+	model.ResponseMIMEType = "application/json"
+	model.ResponseSchema = getRankedObjectResponseSchema()
+
 	var rankedResponse RankedObjectResponse
+
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Increased timeout for Gemini
 		defer cancel()
 
-		completion, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-			Messages: openai.F(conversationHistory),
-			ResponseFormat: openai.F[openai.ChatCompletionNewParamsResponseFormatUnion](
-				openai.ResponseFormatJSONSchemaParam{
-					Type: openai.F(openai.ResponseFormatJSONSchemaTypeJSONSchema),
-					JSONSchema: openai.F(openai.ResponseFormatJSONSchemaJSONSchemaParam{
-						Name:        openai.F("ranked_object_response"),
-						Description: openai.F("List of ranked object IDs"),
-						Schema:      openai.F(RankedObjectResponseSchema),
-						Strict:      openai.Bool(true),
-					}),
-				},
-			),
-			Model: openai.F(r.cfg.OpenAIModel),
-		})
+		cs := model.StartChat()
+		cs.History = conversationHistory[:len(conversationHistory)-1] // Set history excluding the last message which we will send
+		lastMsg := conversationHistory[len(conversationHistory)-1].Parts[0].(genai.Text)
+
+		resp, err := cs.SendMessage(ctx, lastMsg)
+
 		if err == nil {
+			if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+				r.logFromApiCall(runNum, batchNum, "Gemini returned no candidates or empty content")
+				continue
+			}
 
-			conversationHistory = append(conversationHistory,
-				openai.AssistantMessage(completion.Choices[0].Message.Content),
-			)
+			part := resp.Candidates[0].Content.Parts[0]
+			responseText, ok := part.(genai.Text)
+			if !ok {
+				r.logFromApiCall(runNum, batchNum, "Gemini response was not text")
+				continue
+			}
+			responseString := string(responseText)
 
-			err = json.Unmarshal([]byte(completion.Choices[0].Message.Content), &rankedResponse)
+			conversationHistory = append(conversationHistory, resp.Candidates[0].Content)
+
+			err = json.Unmarshal([]byte(responseString), &rankedResponse)
 			if err != nil {
 				r.logFromApiCall(runNum, batchNum, fmt.Sprintf("Error unmarshalling response: %v\n", err))
-				conversationHistory = append(conversationHistory,
-					openai.UserMessage(invalidJSONStr),
-				)
-				trimmedContent := strings.TrimSpace(completion.Choices[0].Message.Content)
-				log.Printf("OpenAI API response: %s", trimmedContent)
+				conversationHistory = append(conversationHistory, &genai.Content{
+					Parts: []genai.Part{genai.Text(invalidJSONStr)},
+					Role:  "user",
+				})
+				trimmedContent := strings.TrimSpace(responseString)
+				log.Printf("Gemini API response: %s", trimmedContent)
 				continue
 			}
 
 			missingIDs, err := validateIDs(&rankedResponse, inputIDs)
 			if err != nil {
 				r.logFromApiCall(runNum, batchNum, fmt.Sprintf("Missing IDs: [%s]", strings.Join(missingIDs, ", ")))
-				conversationHistory = append(conversationHistory,
-					openai.UserMessage(fmt.Sprintf(missingIDsStr, strings.Join(missingIDs, ", "))),
-				)
-				trimmedContent := strings.TrimSpace(completion.Choices[0].Message.Content)
-				log.Printf("OpenAI API response: %s", trimmedContent)
+				conversationHistory = append(conversationHistory, &genai.Content{
+					Parts: []genai.Part{genai.Text(fmt.Sprintf(missingIDsStr, strings.Join(missingIDs, ", ")))},
+					Role:  "user",
+				})
+				trimmedContent := strings.TrimSpace(responseString)
+				log.Printf("Gemini API response: %s", trimmedContent)
 				continue
 			}
 
@@ -725,41 +734,23 @@ func (r *Ranker) callOpenAI(prompt string, runNum int, batchNum int, inputIDs ma
 			continue
 		}
 
-		if customTransport.StatusCode == http.StatusTooManyRequests {
-			for key, values := range customTransport.Headers {
-				if strings.HasPrefix(key, "X-Ratelimit") {
-					for _, value := range values {
-						r.logFromApiCall(runNum, batchNum, fmt.Sprintf("Rate limit header: %s: %s", key, value))
-					}
-				}
-			}
-
-			respBody := customTransport.Body
-			if respBody == nil {
-				r.logFromApiCall(runNum, batchNum, "Error reading response body: %v", "response body is nil")
-			} else {
-				r.logFromApiCall(runNum, batchNum, "Response body: %s", string(respBody))
-			}
-
-			remainingTokensStr := customTransport.Headers.Get("X-Ratelimit-Remaining-Tokens")
-			resetTokensStr := customTransport.Headers.Get("X-Ratelimit-Reset-Tokens")
-
-			remainingTokens, _ := strconv.Atoi(remainingTokensStr)
-			resetDuration, _ := time.ParseDuration(strings.Replace(resetTokensStr, "s", "s", 1))
-
-			r.logFromApiCall(runNum, batchNum, fmt.Sprintf("Rate limit exceeded. Suggested wait time: %v. Remaining tokens: %d", resetDuration, remainingTokens))
-
-			if resetDuration > 0 {
-				r.logFromApiCall(runNum, batchNum, fmt.Sprintf("Waiting for %v before retrying...", resetDuration))
-				time.Sleep(resetDuration)
-			} else {
-				r.logFromApiCall(runNum, batchNum, fmt.Sprintf("Waiting for %v before retrying...", backoff))
-				time.Sleep(backoff)
-				backoff *= 2
-			}
-		} else {
-			log.Fatalf("Run %*d/%d, Batch %*d/%d: Unexpected error: %v", len(strconv.Itoa(r.cfg.NumRuns)), runNum, r.cfg.NumRuns, len(strconv.Itoa(r.numBatches)), batchNum, r.numBatches, err)
+		// Handle Google API errors, including 429 Too Many Requests
+		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "RESOURCE_EXHAUSTED") {
+			r.logFromApiCall(runNum, batchNum, fmt.Sprintf("Rate limit exceeded or resource exhausted: %v. Waiting %v before retrying...", err, backoff))
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
 		}
+
+		// Handle 503 Service Unavailable
+		if strings.Contains(err.Error(), "503") {
+			r.logFromApiCall(runNum, batchNum, fmt.Sprintf("Service unavailable: %v. Waiting %v before retrying...", err, backoff))
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+
+		log.Fatalf("Run %*d/%d, Batch %*d/%d: Unexpected error: %v", len(strconv.Itoa(r.cfg.NumRuns)), runNum, r.cfg.NumRuns, len(strconv.Itoa(r.numBatches)), batchNum, r.numBatches, err)
 	}
 }
 
