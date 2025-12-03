@@ -38,11 +38,13 @@ type Config struct {
 	InitialPrompt   string
 	BatchSize       int
 	NumRuns         int
-	OllamaModel     string
+	OllamaModel     string // Deprecated: Use Model and Provider instead
 	Model           string
+	Provider        string
 	TokenLimit      int
 	RefinementRatio float64
 	GeminiKey       string
+	OpenRouterKey   string
 	OllamaAPIURL    string
 	BatchTokens     int
 }
@@ -61,8 +63,11 @@ func (c *Config) Validate() error {
 	if c.TokenLimit <= 0 {
 		return fmt.Errorf("token limit must be greater than 0")
 	}
-	if c.OllamaModel == "" && c.GeminiKey == "" {
-		return fmt.Errorf("gemini key cannot be empty")
+	if c.Provider == "gemini" && c.GeminiKey == "" {
+		return fmt.Errorf("gemini key cannot be empty when using gemini provider")
+	}
+	if c.Provider == "openrouter" && c.OpenRouterKey == "" {
+		return fmt.Errorf("openrouter key cannot be empty when using openrouter provider")
 	}
 	return nil
 }
@@ -187,11 +192,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	apiKey := os.Getenv("GEMINI_API_KEY")
+	geminiKey := os.Getenv("GEMINI_API_KEY")
+	openRouterKey := os.Getenv("OPENROUTER_API_KEY")
 
 	apiURL := os.Getenv("OLLAMA_API_URL")
 	if apiURL == "" {
 		apiURL = "http://localhost:11434/api/chat"
+	}
+
+	var provider, selectedModel string
+	if *ollamaModel != "" {
+		provider = "ollama"
+		selectedModel = *ollamaModel
+	} else {
+		parts := strings.SplitN(*model, "/", 2)
+		if len(parts) == 2 {
+			provider = parts[0]
+			selectedModel = parts[1]
+		} else {
+			provider = "gemini"
+			selectedModel = *model
+		}
 	}
 
 	config := &Config{
@@ -201,9 +222,11 @@ func main() {
 		OllamaModel:     *ollamaModel,
 		TokenLimit:      tokenLimitThreshold,
 		RefinementRatio: *refinementRatio,
-		GeminiKey:       apiKey,
+		GeminiKey:       geminiKey,
+		OpenRouterKey:   openRouterKey,
 		OllamaAPIURL:    apiURL,
-		Model:           *model,
+		Model:           selectedModel,
+		Provider:        provider,
 		BatchTokens:     *batchTokens,
 	}
 
@@ -525,21 +548,25 @@ func (r *Ranker) estimateTokens(group []Object) int {
 		prompt += fmt.Sprintf(promptFmt, obj.ID, obj.Value)
 	}
 
-	if r.cfg.OllamaModel != "" {
-		// TODO: Update to use Ollama tokenize API when this PR is merged:
-		// https://github.com/ollama/ollama/pull/6586
-		return len(prompt) / 4
-	} else if r.genaiClient != nil {
-		model := r.genaiClient.GenerativeModel(r.cfg.Model)
+	if r.genaiClient != nil {
+		// Use a lightweight Gemini model for token counting if available
+		modelName := "gemini-1.5-flash"
+		if r.cfg.Provider == "gemini" {
+			modelName = r.cfg.Model
+		}
+		model := r.genaiClient.GenerativeModel(modelName)
 		resp, err := model.CountTokens(context.Background(), genai.Text(prompt))
 		if err != nil {
-			log.Printf("Error counting tokens: %v", err)
+			log.Printf("Error counting tokens with Gemini: %v", err)
 			return len(prompt) / 4
 		}
 		return int(resp.TotalTokens)
-	} else {
-		return len(prompt) / 4
 	}
+
+	// Fallback for Ollama or when Gemini client is not available
+	// TODO: Update to use Ollama tokenize API when this PR is merged:
+	// https://github.com/ollama/ollama/pull/6586
+	return len(prompt) / 4
 }
 
 func (r *Ranker) rankObjects(group []Object, runNumber int, batchNumber int) []RankedObject {
@@ -566,10 +593,15 @@ func (r *Ranker) rankObjects(group []Object, runNumber int, batchNumber int) []R
 	for _, obj := range group {
 		inputIDs[obj.ID] = true
 	}
-	if r.cfg.OllamaModel != "" {
+	switch r.cfg.Provider {
+	case "ollama":
 		rankedResponse = r.callOllama(prompt, runNumber, batchNumber, inputIDs)
-	} else {
+	case "openrouter":
+		rankedResponse = r.callOpenRouter(prompt, runNumber, batchNumber, inputIDs)
+	case "gemini":
 		rankedResponse = r.callGemini(prompt, runNumber, batchNumber, inputIDs)
+	default:
+		log.Fatalf("Unknown provider: %s", r.cfg.Provider)
 	}
 
 	// Assign scores based on position in the ranked list
@@ -653,6 +685,132 @@ func validateIDs(rankedResponse *RankedObjectResponse, inputIDs map[string]bool)
 			missingIDsKeys = append(missingIDsKeys, id)
 		}
 		return missingIDsKeys, fmt.Errorf("missing IDs: %s", strings.Join(missingIDsKeys, ", "))
+	}
+}
+
+func (r *Ranker) callOpenRouter(prompt string, runNum int, batchNum int, inputIDs map[string]bool) RankedObjectResponse {
+	var rankedResponse RankedObjectResponse
+
+	conversationHistory := []map[string]interface{}{
+		{"role": "user", "content": prompt},
+	}
+
+	// OpenRouter API URL
+	url := "https://openrouter.ai/api/v1/chat/completions"
+
+	for {
+		// Prepare request body
+		reqBodyMap := map[string]interface{}{
+			"model":    r.cfg.Model,
+			"messages": conversationHistory,
+		}
+
+		requestBody, err := json.Marshal(reqBodyMap)
+		if err != nil {
+			log.Fatalf("Error creating OpenRouter API request body: %v", err)
+		}
+
+		req, err := http.NewRequest("POST", url, bytes.NewReader(requestBody))
+		if err != nil {
+			log.Fatalf("Error creating OpenRouter API request: %v", err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+r.cfg.OpenRouterKey)
+		// req.Header.Set("HTTP-Referer", "https://github.com/...") // Optional
+		// req.Header.Set("X-Title", "Raink") // Optional
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			r.logFromApiCall(runNum, batchNum, fmt.Sprintf("Error making request to OpenRouter API: %v", err))
+			time.Sleep(time.Second) // Simple backoff
+			continue
+		}
+
+		// Handle non-200 responses
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			r.logFromApiCall(runNum, batchNum, fmt.Sprintf("OpenRouter API error: %d, body: %s", resp.StatusCode, body))
+			time.Sleep(time.Second * 2)
+			continue
+		}
+
+		responseBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Fatalf("Error reading OpenRouter response: %v", err)
+		}
+
+		// Parse OpenAI-compatible response
+		var openAIResponse struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+
+		err = json.Unmarshal(responseBody, &openAIResponse)
+		if err != nil {
+			log.Fatalf("Error parsing OpenRouter response: %v", err)
+		}
+
+		if len(openAIResponse.Choices) == 0 {
+			r.logFromApiCall(runNum, batchNum, "OpenRouter returned no choices")
+			continue
+		}
+
+		content := openAIResponse.Choices[0].Message.Content
+
+		conversationHistory = append(conversationHistory, map[string]interface{}{
+			"role":    "assistant",
+			"content": content,
+		})
+
+		// Attempt to parse JSON from content
+		// Content might be wrapped in ```json ... ```
+		cleanContent := strings.TrimSpace(content)
+		if strings.HasPrefix(cleanContent, "```") {
+			// Basic Markdown code block stripping
+			lines := strings.Split(cleanContent, "\n")
+			if len(lines) >= 2 {
+				if strings.HasPrefix(lines[0], "```") {
+					lines = lines[1:]
+				}
+				if strings.HasPrefix(lines[len(lines)-1], "```") {
+					lines = lines[:len(lines)-1]
+				}
+				cleanContent = strings.Join(lines, "\n")
+			}
+		}
+		// Also sometimes it's ```json ... ```
+		cleanContent = strings.ReplaceAll(cleanContent, "```json", "")
+		cleanContent = strings.ReplaceAll(cleanContent, "```", "")
+
+		err = json.Unmarshal([]byte(cleanContent), &rankedResponse)
+		if err != nil {
+			r.logFromApiCall(runNum, batchNum, fmt.Sprintf("Error unmarshalling response JSON: %v", err))
+			conversationHistory = append(conversationHistory, map[string]interface{}{
+				"role":    "user",
+				"content": invalidJSONStr,
+			})
+			log.Printf("OpenRouter raw response: %s", content)
+			continue
+		}
+
+		missingIDs, err := validateIDs(&rankedResponse, inputIDs)
+		if err != nil {
+			r.logFromApiCall(runNum, batchNum, fmt.Sprintf("Missing IDs: %v", missingIDs))
+			conversationHistory = append(conversationHistory, map[string]interface{}{
+				"role":    "user",
+				"content": fmt.Sprintf(missingIDsStr, strings.Join(missingIDs, ", ")),
+			})
+			continue
+		}
+
+		return rankedResponse
 	}
 }
 
@@ -766,7 +924,7 @@ func (r *Ranker) callOllama(prompt string, runNum int, batchNum int, inputIDs ma
 	for {
 
 		requestBody, err := json.Marshal(map[string]interface{}{
-			"model":    r.cfg.OllamaModel,
+			"model":    r.cfg.Model,
 			"stream":   false,
 			"format":   "json",
 			"num_ctx":  r.cfg.BatchTokens,
